@@ -10,7 +10,7 @@ from torch import multiprocessing as mp
 from sbi.mcmc import Slice, SliceSampler
 import sbi.utils as utils
 from sbi.utils.torchutils import atleast_2d
-
+import numpy as np
 
 NEG_INF = torch.tensor(float("-inf"), dtype=torch.float32)
 
@@ -52,6 +52,7 @@ class Posterior:
 
         self._sample_with_mcmc = sample_with_mcmc
         self._mcmc_method = mcmc_method
+        self._mcmc_init_params = None
         self._get_potential_function = get_potential_function
 
         if algorithm_family in ("snpe", "snl", "sre", "aalr"):
@@ -266,33 +267,55 @@ class Posterior:
         mcmc_method: str = "slice-np",
         thin: int = 10,
         warmup: int = 20,
-        num_chains: Optional[int] = 1,
+        num_chains: Optional[int] = 10,
         show_progressbar: Optional[int] = True,
+        num_candidate_inits: int = 10000,
     ) -> Tensor:
         r"""
         Return MCMC samples from posterior $p(\theta|x)$.
 
         Args:
             x: conditioning context for posterior $p(\theta|x)$
-            
             num_samples: desired output samples
-            
             mcmc_method: one of 'metropolis-hastings', 'slice', 'hmc', 'nuts'
-            
             thin: thinning factor for the chain, e.g. for thin=3 only every
                 third sample will be returned, until a total of num_samples
-
             show_progressbar: whether to show a progressbar during sampling
 
         Returns:
             tensor of shape (num_samples, shape_of_single_theta)
         """
 
-        # when using slice-np as mcmc sampler, we can only have a single chain
-        if mcmc_method == "slice-np" and num_chains > 1:
-            warn(
-                "slice-np does not support multiple mcmc chains. Using just a single chain."
+        # find chain init points
+        if self._mcmc_init_params is None:
+            self.neural_net.eval()
+
+            init_param_candidates = self._prior.sample((num_candidate_inits,))
+            potential_function = self._get_potential_function(
+                self._prior, self.neural_net, x, "slice-np"
             )
+            log_weights = torch.cat(
+                [
+                    potential_function(init_param_candidates[i, :])
+                    for i in range(num_candidate_inits)
+                ]
+            )
+
+            probs = np.exp(log_weights.view(-1).numpy().astype(np.float64))
+            probs[np.isnan(probs)] = 0.0
+            probs[np.isinf(probs)] = 0.0
+            probs /= probs.sum()
+            idxs = np.random.choice(
+                a=np.arange(num_candidate_inits),
+                size=num_chains,
+                replace=False,
+                p=probs,
+            )
+            self._mcmc_init_params = init_param_candidates[
+                torch.from_numpy(idxs.astype(int)), :
+            ]
+
+            self.neural_net.train()
 
         # XXX: maybe get whole sampler instead of just potential function?
         potential_function = self._get_potential_function(
@@ -300,7 +323,13 @@ class Posterior:
         )
         if mcmc_method == "slice-np":
             samples = self.slice_np_mcmc(
-                num_samples, potential_function, x, thin, warmup
+                num_samples,
+                potential_function,
+                x,
+                self._mcmc_init_params,
+                thin,
+                warmup,
+                num_chains,
             )
         else:
             samples = self.pyro_mcmc(
@@ -321,29 +350,42 @@ class Posterior:
         num_samples: int,
         potential_function: Callable,
         x: torch.Tensor,
-        thin: int = 10,
-        warmup_steps: int = 20,
+        init_param: Tensor,
+        thin: int,
+        warmup_steps: int,
+        num_chains: int,
     ) -> Tensor:
-
         # go into eval mode for evaluating during sampling
         # XXX set eval mode outside of calls to sample
         self.neural_net.eval()
 
-        posterior_sampler = SliceSampler(
-            utils.tensor2numpy(self._prior.sample((1,))).reshape(-1),
-            lp_f=potential_function,
-            thin=thin,
-        )
+        dim_samples = init_param.shape[1]
 
-        posterior_sampler.gen(warmup_steps)
+        all_samples = []
+        for c in range(num_chains):
+            posterior_sampler = SliceSampler(
+                utils.tensor2numpy(init_param[c, :]).reshape(-1),
+                lp_f=potential_function,
+                thin=thin,
+            )
+            if warmup_steps > 0:
+                posterior_sampler.gen(int(warmup_steps))
+            all_samples.append(posterior_sampler.gen(int(num_samples / num_chains)))
+        all_samples = np.stack(all_samples).astype(np.float32)
 
-        samples = posterior_sampler.gen(num_samples)
+        samples = torch.from_numpy(all_samples)  # chains x samples x dim
+        self._mcmc_init_params = samples[:, -1, :].reshape(num_chains, dim_samples)
+
+        samples = samples.reshape(-1, dim_samples)[:num_samples, :]
+
+        assert samples.shape[0] == num_samples
+        assert self._mcmc_init_params.shape[0] == num_chains
 
         # back to training mode
         # XXX train exited in log_prob, entered here?
         self.neural_net.train(True)
 
-        return torch.tensor(samples, dtype=torch.float32)
+        return samples
 
     def pyro_mcmc(
         self,

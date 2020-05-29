@@ -154,7 +154,7 @@ def sample_posterior_within_prior(
     # is leakage (acceptance rate<1) so sample again until reaching `num_samples`.
     while num_remaining > 0:
 
-        candidates = posterior_nn.sample(num_remaining, context=x)
+        candidates = posterior_nn.sample(num_remaining, context=x).detach()
         # TODO we need this reshape here because posterior_nn.sample sometimes return
         # leading singleton dimension instead of (num_samples), e.g., (1, 10000, 4)
         # instead of (10000, 4). This can't be handled by MultipleIndependent, see #141.

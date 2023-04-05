@@ -12,6 +12,10 @@ from sbi.utils import BoxUniform, likelihood_nn, mcmc_transform
 from sbi.utils.torchutils import atleast_2d
 from sbi.utils.user_input_checks_utils import MultipleIndependent
 from tests.test_utils import check_c2st
+from sbi.inference.potentials.likelihood_based_potential import (
+    MixedLikelihoodBasedPotential,
+)
+from sbi.utils.conditional_density_utils import ConditionedPotential
 
 
 @pytest.mark.gpu
@@ -154,8 +158,10 @@ class PotentialFunctionProvider(BasePotential):
 
     allow_iid_x = True  # type: ignore
 
-    def __init__(self, prior, x_o, device="cpu"):
+    def __init__(self, prior, x_o, concentration_scaling=1.0, device="cpu"):
         super().__init__(prior, x_o, device)
+
+        self.concentration_scaling = concentration_scaling
 
     def __call__(self, theta, track_gradients: bool = True):
         theta = atleast_2d(theta)
@@ -179,7 +185,8 @@ class PotentialFunctionProvider(BasePotential):
         lp_rts = torch.stack(
             [
                 InverseGamma(
-                    concentration=2 * torch.ones_like(beta_i), rate=beta_i
+                    concentration=self.concentration_scaling * torch.ones_like(beta_i),
+                    rate=beta_i,
                 ).log_prob(self.x_o[:, :1])
                 for beta_i in theta[:, :1]
             ],
